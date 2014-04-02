@@ -211,3 +211,7 @@ func (d *Driver) Exists(id string) bool {
 	_, err := os.Stat(dir)
 	return err == nil
 }
+
+func (d *Driver) Operation(op string, args []string) error {
+	return fmt.Errorf("Operation %s not supported", op)
+}

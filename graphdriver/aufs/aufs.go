@@ -399,3 +399,7 @@ func rollbackMount(target string, err error) {
 		Unmount(target)
 	}
 }
+
+func (a Driver) Operation(op string, args []string) error {
+	return fmt.Errorf("Operation %s not supported", op)
+}
