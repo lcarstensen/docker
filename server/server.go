@@ -234,8 +234,10 @@ func (srv *Server) Events(job *engine.Job) engine.Status {
 	}
 
 	var (
-		from  = job.Args[0]
-		since = job.GetenvInt64("since")
+		from    = job.Args[0]
+		since   = job.GetenvInt64("since")
+		until   = job.GetenvInt64("until")
+		timeout = time.NewTimer(time.Unix(until, 0).Sub(time.Now()))
 	)
 	sendEvent := func(event *utils.JSONMessage) error {
 		b, err := json.Marshal(event)
@@ -264,9 +266,9 @@ func (srv *Server) Events(job *engine.Job) engine.Status {
 	srv.Unlock()
 	job.Stdout.Write(nil) // flush
 	if since != 0 {
-		// If since, send previous events that happened after the timestamp
+		// If since, send previous events that happened after the timestamp and until timestamp
 		for _, event := range srv.GetEvents() {
-			if event.Time >= since {
+			if event.Time >= since && (event.Time <= until || until == 0) {
 				err := sendEvent(&event)
 				if err != nil && err.Error() == "JSON error" {
 					continue
@@ -278,13 +280,23 @@ func (srv *Server) Events(job *engine.Job) engine.Status {
 			}
 		}
 	}
-	for event := range listener {
-		err := sendEvent(&event)
-		if err != nil && err.Error() == "JSON error" {
-			continue
-		}
-		if err != nil {
-			return job.Error(err)
+
+	// If no until, disable timeout
+	if until == 0 {
+		timeout.Stop()
+	}
+	for {
+		select {
+		case event := <-listener:
+			err := sendEvent(&event)
+			if err != nil && err.Error() == "JSON error" {
+				continue
+			}
+			if err != nil {
+				return job.Error(err)
+			}
+		case <-timeout.C:
+			return engine.StatusOK
 		}
 	}
 	return engine.StatusOK
@@ -353,7 +365,7 @@ func (srv *Server) ImageExport(job *engine.Job) engine.Status {
 		rootRepoMap[name] = rootRepo
 		rootRepoJson, _ := json.Marshal(rootRepoMap)
 
-		if err := ioutil.WriteFile(path.Join(tempdir, "repositories"), rootRepoJson, os.ModeAppend); err != nil {
+		if err := ioutil.WriteFile(path.Join(tempdir, "repositories"), rootRepoJson, os.FileMode(0644)); err != nil {
 			return job.Error(err)
 		}
 	} else {
@@ -382,7 +394,7 @@ func (srv *Server) exportImage(img *image.Image, tempdir string) error {
 	for i := img; i != nil; {
 		// temporary directory
 		tmpImageDir := path.Join(tempdir, i.ID)
-		if err := os.Mkdir(tmpImageDir, os.ModeDir); err != nil {
+		if err := os.Mkdir(tmpImageDir, os.FileMode(0755)); err != nil {
 			if os.IsExist(err) {
 				return nil
 			}
@@ -392,7 +404,7 @@ func (srv *Server) exportImage(img *image.Image, tempdir string) error {
 		var version = "1.0"
 		var versionBuf = []byte(version)
 
-		if err := ioutil.WriteFile(path.Join(tmpImageDir, "VERSION"), versionBuf, os.ModeAppend); err != nil {
+		if err := ioutil.WriteFile(path.Join(tmpImageDir, "VERSION"), versionBuf, os.FileMode(0644)); err != nil {
 			return err
 		}
 
@@ -401,7 +413,7 @@ func (srv *Server) exportImage(img *image.Image, tempdir string) error {
 		if err != nil {
 			return err
 		}
-		if err := ioutil.WriteFile(path.Join(tmpImageDir, "json"), b, os.ModeAppend); err != nil {
+		if err := ioutil.WriteFile(path.Join(tmpImageDir, "json"), b, os.FileMode(0644)); err != nil {
 			return err
 		}
 
@@ -859,7 +871,7 @@ func (srv *Server) DockerInfo(job *engine.Job) engine.Status {
 func (srv *Server) DockerVersion(job *engine.Job) engine.Status {
 	v := &engine.Env{}
 	v.Set("Version", dockerversion.VERSION)
-	v.Set("ApiVersion", string(api.APIVERSION))
+	v.SetJson("ApiVersion", api.APIVERSION)
 	v.Set("GitCommit", dockerversion.GITCOMMIT)
 	v.Set("GoVersion", goruntime.Version())
 	v.Set("Os", goruntime.GOOS)
@@ -1744,15 +1756,6 @@ func (srv *Server) ContainerCreate(job *engine.Job) engine.Status {
 		job.Errorf("Your kernel does not support swap limit capabilities. Limitation discarded.\n")
 		config.MemorySwap = -1
 	}
-	resolvConf, err := utils.GetResolvConf()
-	if err != nil {
-		return job.Error(err)
-	}
-	if !config.NetworkDisabled && len(config.Dns) == 0 && len(srv.runtime.Config().Dns) == 0 && utils.CheckLocalDns(resolvConf) {
-		job.Errorf("Local (127.0.0.1) DNS resolver found in resolv.conf and containers can't use it. Using default external servers : %v\n", runtime.DefaultDns)
-		config.Dns = runtime.DefaultDns
-	}
-
 	container, buildWarnings, err := srv.runtime.Create(config, name)
 	if err != nil {
 		if srv.runtime.Graph().IsNotExist(err) {
